@@ -6,6 +6,7 @@ import json
 import uuid
 import io
 import html
+import unicodedata
 import inspect
 import os
 import re
@@ -481,7 +482,7 @@ def add_attachment(con, folio, f, kind, user_id):
 def flash():
     msg = st.session_state.pop("flash", None)
     if msg:
-        st.success(msg)
+        (st.warning if st.session_state.pop("flash_warn", False) else st.success)(msg)
 
 
 # --------------------------- Qué es cada razón financiera ---------------------------
@@ -774,6 +775,160 @@ def clean_accounts(data):
     df["Disminucion"] = (-df["Cambio"]).clip(lower=0)
     return df.reset_index(drop=True)
 
+# --------------------------- Lectura automática de archivos ---------------------------
+
+def _norm(s):
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    s = re.sub(r"\(\s*[-−]\s*\)", " ", s)
+    s = re.sub(r"[^a-zA-Z0-9 ]", " ", s).lower()
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_ALIAS = {
+    "cuentas por cobrar": "Clientes", "cuentas por pagar": "Proveedores", "inventario": "Inventarios",
+    "efectivo": "Caja", "ventas netas": "Ventas", "ingresos": "Ventas", "iva por acreditar": "IVA acreditable",
+    "equipo de computo": "Equipo de cómputo", "gastos de operacion": "Gastos de administración",
+}
+LOOKUP = {_norm(c): c for cs in CATALOGO.values() for c in cs}
+LOOKUP.update({_norm(k): v for k, v in _ALIAS.items()})
+
+
+def _to_num(tok):
+    t = str(tok).strip().replace("$", "").replace("MXN", "").strip()
+    if t in {"-", "—", "–"}:
+        return 0.0
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()").replace(",", "").strip()
+    if t.startswith("-"):
+        neg, t = True, t[1:]
+    if not re.fullmatch(r"\d+(\.\d+)?", t):
+        return None
+    return -float(t) if neg else float(t)
+
+
+def _from_cells(cells):
+    """Fila de tabla: primera celda de texto = concepto; celdas numéricas siguientes = saldos."""
+    label, nums = "", []
+    for c in cells:
+        v = _to_num(c)
+        if v is None:
+            label = label or c
+        elif label:
+            nums.append(v)
+    return label, nums
+
+
+def _from_line(line):
+    """Línea de texto (PDF): el concepto va primero y los importes al final."""
+    toks = [t for t in line.split() if t not in {"$", "MXN"}]
+    nums = []
+    while toks and _to_num(toks[-1]) is not None:
+        nums.insert(0, _to_num(toks.pop()))
+    return " ".join(toks), nums
+
+
+def _stitch(lines):
+    """Algunos PDF entregan cada columna en su propia línea: une el concepto con sus importes."""
+    out = []
+    for ln in lines:
+        label, nums = _from_line(ln)
+        if out and nums and not label:
+            prev_label, prev_nums = _from_line(out[-1])
+            if prev_label and len(prev_nums) < 3:
+                out[-1] += " " + ln.strip()
+                continue
+        out.append(ln)
+    return out
+
+
+def _read_rows(f):
+    ext = f.name.rsplit(".", 1)[-1].lower()
+    data = f.getvalue()
+    rows, lines = [], []
+
+    def add_cells(cells):
+        cells = [str(c).strip() for c in cells if pd.notna(c) and str(c).strip()]
+        if cells:
+            rows.append(_from_cells(cells))
+            lines.append(" ".join(cells))
+
+    def add_line(line):
+        if line.strip():
+            rows.append(_from_line(line))
+            lines.append(line)
+
+    if ext in ("xlsx", "xls"):
+        for sheet in pd.read_excel(io.BytesIO(data), sheet_name=None, header=None).values():
+            for row in sheet.itertuples(index=False):
+                add_cells(row)
+    elif ext == "csv":
+        text = data.decode("utf-8-sig", errors="replace")
+        sheet = pd.read_csv(io.StringIO(text), header=None, sep=None, engine="python", dtype=str)
+        for row in sheet.itertuples(index=False):
+            add_cells(row)
+    elif ext == "pdf":
+        from pypdf import PdfReader
+        raw = []
+        for page in PdfReader(io.BytesIO(data)).pages:
+            try:
+                text = page.extract_text(extraction_mode="layout") or ""
+            except TypeError:  # versiones antiguas de pypdf
+                text = page.extract_text() or ""
+            raw.extend(text.splitlines())
+        for line in _stitch(raw):
+            add_line(line)
+    elif ext == "docx":
+        from docx import Document
+        d = Document(io.BytesIO(data))
+        for p in d.paragraphs:
+            add_line(p.text)
+        for t in d.tables:
+            for r in t.rows:
+                add_cells([c.text for c in r.cells])
+    else:
+        raise ValueError("las imágenes no se pueden leer automáticamente")
+    return rows, lines
+
+
+def _recent_first(lines):
+    """True si el encabezado del archivo pone la columna reciente antes que la anterior."""
+    for line in lines:
+        n = _norm(line)
+        a, b = re.search(r"\b(reciente|actual)\b", n), re.search(r"\banterior\b", n)
+        if a and b:
+            return a.start() < b.start()
+    return False
+
+
+def extract_accounts(files):
+    """Lee los archivos y devuelve (cuentas, n_leidas, no_reconocidas, avisos).
+    Toma por cada concepto del catálogo los dos primeros importes: anterior y reciente."""
+    found, unknown, warns = {}, [], []
+    for f in files:
+        try:
+            rows, lines = _read_rows(f)
+        except Exception as e:
+            warns.append(f"{f.name}: no se pudo leer ({e}).")
+            continue
+        swap = _recent_first(lines)
+        for label, nums in rows:
+            key = LOOKUP.get(_norm(label))
+            if not key:
+                n = _norm(label)
+                if nums and len(n) > 2 and not n.startswith("total"):
+                    unknown.append(label)
+                continue
+            if not nums:
+                continue
+            old, new = (0.0, nums[0]) if len(nums) == 1 else (nums[0], nums[1])
+            if swap and len(nums) > 1:
+                old, new = new, old
+            found[key] = (abs(old), abs(new))
+    accounts = base_accounts()
+    for a in accounts:
+        if a["Concepto"] in found:
+            a["Anterior"], a["Reciente"] = found[a["Concepto"]]
+    return accounts, len(found), unknown, warns
 
 def totals(df, period):
     """Totales calculados desde las cuentas individuales; evita sumar totales duplicados."""
@@ -1385,12 +1540,32 @@ elif page == "Nuevo análisis":
                 for e in upload_errors:
                     st.error(e)
             else:
-                folio = save_new_analysis(clean_accounts(base_accounts()), uploads, doc_kind, pending_capture=True)
+                accounts, n_found, unknown, warns = extract_accounts(uploads)
+                if n_found >= 3:
+                    df_new = clean_accounts(accounts)
+                    folio = save_new_analysis(df_new, uploads, doc_kind,
+                                              note=f"Captura automática: {n_found} cuenta(s) leída(s).")
+                    gap = totals(df_new, "Reciente")["Activo total"] - totals(df_new, "Reciente")["Pasivo más capital"]
+                    msg = f"Se leyeron {n_found} cuenta(s) del archivo y se generaron los estados. "
+                    if abs(gap) < 0.01:
+                        msg += "El balance reciente cuadra."
+                    else:
+                        msg += (f"El balance reciente NO cuadra (diferencia {gap:,.2f}): revisa que los saldos "
+                                "leídos sean correctos y, si hay un error, solicita el cambio.")
+                    if unknown:
+                        msg += f" No se reconocieron {len(unknown)} renglón(es), p. ej.: {', '.join(unknown[:3])}."
+                    st.session_state.flash_warn = abs(gap) >= 0.01 or bool(unknown)
+                    st.session_state.page = "Estados financieros"
+                else:
+                    folio = save_new_analysis(clean_accounts(base_accounts()), uploads, doc_kind,
+                                              pending_capture=True, note="No se pudieron leer saldos.")
+                    msg = ("No se pudieron leer saldos del archivo (puede ser un PDF escaneado o una imagen). "
+                           "Se guardó y el administrador capturará los saldos.")
+                    st.session_state.flash_warn = True
+                    st.session_state.page = "Documentos"
                 st.session_state.upl_n = upl_n + 1
                 st.session_state.current_folio = folio
-                st.session_state.flash = ("Archivo enviado. El administrador capturará los saldos; "
-                                          "podrás verlos cuando estén listos.")
-                st.session_state.page = "Documentos"
+                st.session_state.flash = msg
                 st.rerun()
         st.stop()
 
@@ -1399,11 +1574,9 @@ elif page == "Nuevo análisis":
       f'<span class="chip">{esc(st.session_state.draft_old_date)} → {esc(st.session_state.draft_new_date)}</span>'
       f'<span class="chip">{esc(st.session_state.draft_currency)}</span>'
       f'<span class="chip">Elaboró: {esc(user["username"])}</span></div>')
-    st.info(
-        "Captura saldos contables en ambos periodos. Las cuentas del estado de resultados son opcionales "
-        "y solo alimentan las razones de rentabilidad; no se suman al activo, pasivo ni capital. "
-        "**Pulsa «Aplicar cambios» en cada sección que edites antes de guardar.**"
-    )
+    st.info("Sube tu archivo de estados financieros (Excel, CSV, PDF con texto o Word). "
+        "El sistema leerá los saldos y generará los estados automáticamente. "
+        "Después no podrás modificar cantidades: cualquier corrección se solicita al administrador.")
 
     if "draft_accounts" not in st.session_state:
         st.session_state.draft_accounts = base_accounts()

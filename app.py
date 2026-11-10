@@ -1149,6 +1149,39 @@ page = st.session_state.page
 
 
 # --------------------------- Panel ---------------------------
+def save_new_analysis(df, uploads, doc_kind, pending_capture=False):
+    folio = "FIN-" + datetime.now().strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:8].upper()
+    now = now_iso()
+    with db() as con:
+        con.execute("""
+            INSERT INTO analyses(
+              folio,owner_id,company,rfc,activity,currency,comparison_type,
+              old_date,new_date,accounts_json,adjustments_json,ratios_json,created_at,elaboro,reviso,autorizo
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            folio, user["id"], st.session_state.draft_company,
+            st.session_state.get("draft_rfc", ""),
+            st.session_state.get("draft_activity", ""),
+            st.session_state.draft_currency,
+            st.session_state.draft_comparison_type,
+            st.session_state.draft_old_date,
+            st.session_state.draft_new_date,
+            json.dumps(df.to_dict("records"), ensure_ascii=False),
+            "{}", "[]", now,
+            user["username"], st.session_state.get("draft_reviso", ""), st.session_state.get("draft_autorizo", "")
+        ))
+        for u in uploads or []:
+            add_attachment(con, folio, u, doc_kind, user["id"])
+        log_event(folio, user["id"], "Análisis creado",
+                  f"{len(uploads or [])} documento(s) adjunto(s)", con)
+        if pending_capture:
+            cur_ = con.execute(
+                "INSERT INTO change_requests(folio,requester_id,reason,created_at) VALUES(?,?,?,?)",
+                (folio, user["id"],
+                 "Captura inicial de saldos: el contador subió su archivo de estados financieros "
+                 "y los importes están pendientes de captura.", now))
+            log_event(folio, user["id"], "Captura pendiente", f"Solicitud #{cur_.lastrowid}", con)
+    return folio
 
 if page == "Panel":
     with db() as con:
@@ -1323,9 +1356,42 @@ elif page == "Nuevo análisis":
 
     required_keys = ["draft_company", "draft_currency", "draft_old_date", "draft_new_date", "draft_comparison_type"]
     ready = all(k in st.session_state for k in required_keys)
-    H(stepper_html(2 if ready else 1, ["Datos generales", "Captura de cuentas", "Guardar y analizar"]), stepper_slot)
+    H(stepper_html(2 if ready else 1, ["Datos generales",
+                                       "Captura de cuentas" if is_admin else "Subir archivo",
+                                       "Guardar y analizar"]), stepper_slot)
     if not ready:
         st.info("Confirma los datos generales para abrir la captura de cuentas.")
+        st.stop()
+    if not is_admin:
+        upl_n = st.session_state.get("upl_n", 0)
+        st.subheader("Sube tu archivo")
+        H(f'<div class="chips"><span class="chip"><b>{esc(st.session_state.draft_company)}</b></span>'
+          f'<span class="chip">{esc(st.session_state.draft_old_date)} → {esc(st.session_state.draft_new_date)}</span>'
+          f'<span class="chip">{esc(st.session_state.draft_currency)}</span>'
+          f'<span class="chip">Elaboró: {esc(user["username"])}</span></div>')
+        st.info("Como contador solo subes el archivo de los estados financieros. "
+                "Los saldos los captura y valida el administrador; tú no puedes modificar cantidades.")
+        doc_kind = st.selectbox("Tipo de documento", DOC_KINDS, key=f"draft_kind_{upl_n}")
+        uploads = st.file_uploader(f"Archivos (máx. {MAX_MB} MB c/u)", accept_multiple_files=True,
+                                   type=sorted(ALLOWED_EXT), key=f"draft_files_{upl_n}")
+        confirm_send = st.checkbox(
+            "Confirmo que el archivo es el correcto. Entiendo que no podré modificarlo ni cambiar cantidades; "
+            "cualquier corrección se solicita al administrador.", key=f"confirm_send_{upl_n}")
+        if st.button("Enviar archivo y guardar análisis", type="primary", disabled=not confirm_send):
+            upload_errors = [e for e in (validate_upload(u) for u in (uploads or [])) if e]
+            if not uploads:
+                st.error("Sube al menos un archivo.")
+            elif upload_errors:
+                for e in upload_errors:
+                    st.error(e)
+            else:
+                folio = save_new_analysis(clean_accounts(base_accounts()), uploads, doc_kind, pending_capture=True)
+                st.session_state.upl_n = upl_n + 1
+                st.session_state.current_folio = folio
+                st.session_state.flash = ("Archivo enviado. El administrador capturará los saldos; "
+                                          "podrás verlos cuando estén listos.")
+                st.session_state.page = "Documentos"
+                st.rerun()
         st.stop()
 
     st.subheader("Captura del balance y cuentas complementarias")
@@ -1412,31 +1478,11 @@ elif page == "Nuevo análisis":
             for e in upload_errors:
                 st.error(e)
         else:
-            folio = "FIN-" + datetime.now().strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:8].upper()
-            now = datetime.now().isoformat(timespec="seconds")
-            with db() as con:
-                con.execute("""
-                    INSERT INTO analyses(
-                      folio,owner_id,company,rfc,activity,currency,comparison_type,
-                      old_date,new_date,accounts_json,adjustments_json,ratios_json,created_at,elaboro,reviso,autorizo
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    folio, user["id"], st.session_state.draft_company,
-                    st.session_state.get("draft_rfc", ""),
-                    st.session_state.get("draft_activity", ""),
-                    st.session_state.draft_currency,
-                    st.session_state.draft_comparison_type,
-                    st.session_state.draft_old_date,
-                    st.session_state.draft_new_date,
-                    json.dumps(df.to_dict("records"), ensure_ascii=False),
-                    "{}", "[]", now,
-                    user["username"], st.session_state.get("draft_reviso", ""), st.session_state.get("draft_autorizo", "")
-                ))
-                for u in uploads or []:
-                    add_attachment(con, folio, u, doc_kind, user["id"])
-                log_event(folio, user["id"], "Estados financieros guardados",
-                          f"{len(uploads or [])} documento(s) adjunto(s)", con)
+            folio = save_new_analysis(df, uploads, doc_kind)
             st.session_state.upl_n = upl_n + 1
+            st.session_state.current_folio = folio
+            st.session_state.page = "Hoja verde"
+            st.rerun()
             st.session_state.current_folio = folio
             st.session_state.page = "Hoja verde"
             st.rerun()
@@ -1467,7 +1513,13 @@ elif page in ["Estados financieros", "Hoja verde", "Razones financieras", "Gráf
 
     page_header(record["company"],
                 f"Folio {record['folio']} · {record['old_date']} → {record['new_date']} · {cur}", page)
-
+    if not (df["Anterior"].abs().sum() or df["Reciente"].abs().sum()) and page != "Editar estados":
+        if is_admin:
+            st.warning("Este análisis aún no tiene saldos. Captúralos en «Editar estados» "
+                        "usando el archivo que subió el contador (sección «Documentos»).")
+        else:
+            st.info("Tu archivo fue recibido. El administrador capturará los saldos y cuando termine "
+                    "verás aquí los resultados.")
     # ----- Hoja verde -----
     if page == "Hoja verde":
         kpi_row([

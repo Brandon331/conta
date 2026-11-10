@@ -7,6 +7,8 @@ import uuid
 import io
 import html
 import inspect
+import os
+import re
 from datetime import date, datetime
 from xml.sax.saxutils import escape as xesc
 from collections import OrderedDict
@@ -155,6 +157,27 @@ section[data-testid="stSidebar"] :focus-visible{outline:3px solid #fff!important
 .auth-points{list-style:none;padding:0;margin:1.4rem 0 0;display:grid;gap:.55rem;color:var(--muted);font-size:.9rem}
 .auth-points li{display:flex;gap:.6rem;align-items:center}.auth-points svg{color:var(--brand);flex:none}
 
+/* Estados financieros */
+.stmt-wrap{background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow-x:auto;margin:.4rem 0 1rem}
+.stmt{width:100%;border-collapse:collapse;font-size:.92rem}
+.stmt th{background:#F0F3F9;color:var(--muted);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;text-align:left;padding:10px 14px;border-bottom:1px solid var(--line)}
+.stmt th.num,.stmt td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stmt td{padding:8px 14px;border-bottom:1px solid #EEF1F6}
+.stmt tr.sec td{background:var(--info-bg);color:var(--navy);font-weight:600;font-size:.8rem;letter-spacing:.04em;text-transform:uppercase}
+.stmt tr.item td:first-child{padding-left:30px}
+.stmt tr.tot td{font-weight:600;border-top:1px solid #C3CDDD}
+.stmt tr.grand td{font-weight:700;background:#F0F3F9;color:var(--navy);border-top:2px solid var(--navy)}
+.sign-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:0 0 1rem}
+.sign{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px}
+.sign small{font-size:.7rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);display:block}
+.sign b{display:block;margin-top:.3rem;color:var(--navy);overflow-wrap:anywhere}
+.lock{display:flex;gap:.65rem;align-items:flex-start;background:var(--warn-bg);color:#5C3A00;border-radius:12px;padding:.8rem 1rem;margin:0 0 1rem;font-size:.92rem}
+.lock svg{flex:none;margin-top:2px}
+.gloss{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.gloss>div{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:.88rem}
+.gloss b{color:var(--navy);display:block}.gloss span{color:var(--muted);font-size:.78rem;display:block;margin:.1rem 0 .4rem}
+.gloss em{color:var(--muted)}
+
 @media (max-width:640px){
   .block-container{padding:1.2rem 1rem 3rem}
   .kpis{grid-template-columns:1fr 1fr}.ratios{grid-template-columns:1fr}
@@ -173,6 +196,9 @@ ICONS = {
     "file-text": '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" x2="8" y1="13" y2="13"/><line x1="16" x2="8" y1="17" y2="17"/>',
     "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
     "check": '<polyline points="20 6 9 17 4 12"/>',
+    "lock": '<rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    "folder": '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+    "edit": '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
     "scale": '<path d="M12 3v18M5 21h14M5 7h14M5 7l-3 7a4 4 0 0 0 6 0L5 7zM19 7l-3 7a4 4 0 0 0 6 0l-3-7z"/>',
 }
 
@@ -221,7 +247,8 @@ def go(page_name):
 
 def fmt_money(value):
     try:
-        return f"${float(value):,.2f}"
+        v = float(value)
+        return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
     except (TypeError, ValueError):
         return "$0.00"
 
@@ -352,6 +379,276 @@ CATEGORIAS_BALANCE = [
 CUENTAS_CONTRA_ACTIVO = {"Depreciación acumulada", "Amortización acumulada"}
 CUENTAS_RESULTADO = set(CATALOGO["Estado de resultados (opcional)"])
 
+# --------------------------- Roles, archivos y bitácora ---------------------------
+
+ROLE_LABEL = {"usuario": "Contador", "admin": "Administrador"}
+DOC_KINDS = ["Estado financiero", "Balanza de comprobación", "Comprobante o soporte", "Otro"]
+ALLOWED_EXT = {"pdf", "xlsx", "xls", "csv", "docx", "png", "jpg", "jpeg"}
+MAX_MB = 10
+
+NEW_TABLES = """
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folio TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    data BLOB NOT NULL,
+    uploaded_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(folio) REFERENCES analyses(folio)
+);
+CREATE TABLE IF NOT EXISTS change_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folio TEXT NOT NULL,
+    requester_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pendiente',
+    resolver_id INTEGER,
+    resolution_note TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    FOREIGN KEY(folio) REFERENCES analyses(folio)
+);
+CREATE TABLE IF NOT EXISTS analysis_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    folio TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def analysis_for(folio, user):
+    """El contador solo accede a sus análisis; el administrador, a todos."""
+    if not folio:
+        return None
+    sql = ("SELECT a.*, u.username AS owner_name FROM analyses a "
+           "JOIN users u ON u.id=a.owner_id WHERE a.folio=?")
+    args = [str(folio).strip()]
+    if user["role"] != "admin":
+        sql += " AND a.owner_id=?"
+        args.append(user["id"])
+    with db() as con:
+        return con.execute(sql, args).fetchone()
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def log_event(folio, user_id, action, detail="", con=None):
+    sql = "INSERT INTO analysis_log(folio,user_id,action,detail,created_at) VALUES(?,?,?,?,?)"
+    args = (folio, user_id, action, str(detail)[:1500], now_iso())
+    if con is not None:
+        con.execute(sql, args)
+    else:
+        with db() as c:
+            c.execute(sql, args)
+
+
+def safe_name(name):
+    base = os.path.basename(str(name).replace("\\", "/"))
+    return re.sub(r"[^\w.\- ()]", "_", base)[:120] or "archivo"
+
+
+def validate_upload(f):
+    """Devuelve un mensaje de error, o cadena vacía si el archivo es válido."""
+    ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+    if ext not in ALLOWED_EXT:
+        return f"{f.name}: tipo de archivo no permitido."
+    if f.size == 0:
+        return f"{f.name}: el archivo está vacío."
+    if f.size > MAX_MB * 1024 * 1024:
+        return f"{f.name}: excede el máximo de {MAX_MB} MB."
+    if ext == "pdf" and bytes(f.getbuffer()[:5]) != b"%PDF-":
+        return f"{f.name}: no es un PDF válido."
+    return ""
+
+
+def add_attachment(con, folio, f, kind, user_id):
+    data = f.getvalue()
+    con.execute(
+        "INSERT INTO attachments(folio,filename,kind,size,sha256,data,uploaded_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (folio, safe_name(f.name), kind, len(data), hashlib.sha256(data).hexdigest(), data, user_id, now_iso())
+    )
+    log_event(folio, user_id, "Documento agregado", f"{safe_name(f.name)} ({kind})", con)
+
+
+def flash():
+    msg = st.session_state.pop("flash", None)
+    if msg:
+        st.success(msg)
+
+
+# --------------------------- Qué es cada razón financiera ---------------------------
+
+RATIO_INFO = {
+    "Razón circulante": ("Mide la capacidad de la empresa para pagar sus deudas de corto plazo con sus activos de corto plazo.",
+                         "Mayor a 1: el activo circulante cubre el pasivo circulante. Un valor muy alto puede indicar recursos ociosos."),
+    "Prueba ácida": ("Igual que la razón circulante, pero sin contar los inventarios, que son lo más lento de convertir en efectivo.",
+                     "Mayor a 1: puede pagar sus deudas de corto plazo sin vender inventario."),
+    "Razón de efectivo": ("Mide cuánto del pasivo de corto plazo podría pagarse hoy solo con caja y bancos.",
+                          "Es la medida de liquidez más estricta; un valor bajo no es grave si la cobranza es constante."),
+    "Capital de trabajo": ("Dinero que queda para operar después de pagar las deudas de corto plazo con los activos de corto plazo.",
+                           "Positivo indica holgura operativa; negativo, presión de liquidez."),
+    "Endeudamiento": ("Porcentaje de los activos que está financiado con deudas (pasivo total).",
+                      "Entre más alto, mayor dependencia de acreedores y mayor riesgo financiero."),
+    "Autonomía financiera": ("Porcentaje de los activos que está financiado con recursos propios (capital contable).",
+                             "Entre más alto, mayor independencia de acreedores. Complementa al endeudamiento."),
+    "Deuda a capital": ("Cuántos pesos de deuda tiene la empresa por cada peso de capital propio.",
+                        "Mayor a 1: se debe más de lo que aportan los dueños."),
+    "Margen bruto": ("Porcentaje de las ventas que queda después de pagar el costo de lo vendido.",
+                     "Refleja la rentabilidad de los productos antes de los gastos de operación."),
+    "Margen operativo": ("Porcentaje de las ventas que queda después del costo de ventas y los gastos de operación, antes de intereses e impuestos.",
+                         "Indica qué tan rentable es la operación normal del negocio."),
+    "Margen neto": ("Porcentaje de las ventas que se convierte en utilidad final, ya descontados costos, gastos, intereses e impuestos.",
+                    "Indica cuánto gana la empresa por cada 100 pesos vendidos."),
+    "ROA": ("Rendimiento sobre los activos: utilidad neta generada por cada 100 pesos invertidos en activos.",
+            "Mide qué tan bien se aprovechan los activos para generar utilidades."),
+    "ROE": ("Rendimiento sobre el capital: utilidad neta generada por cada 100 pesos aportados por los dueños.",
+            "Mide el retorno para los propietarios; debe leerse junto con el endeudamiento."),
+    "Rotación de activos": ("Cuántas veces las ventas del periodo equivalen al total de activos.",
+                            "Mayor valor: la empresa usa sus activos con más eficiencia para vender."),
+    "Rotación de inventarios": ("Cuántas veces se renueva el inventario en el periodo (costo de ventas entre inventarios).",
+                                "Mayor valor: el inventario se vende más rápido. Muy bajo puede indicar mercancía detenida."),
+    "Rotación de cuentas por cobrar": ("Cuántas veces en el periodo se cobra el saldo de clientes (ventas entre clientes).",
+                                       "Mayor valor: cobranza más ágil."),
+    "Rotación de proveedores": ("Cuántas veces en el periodo se paga el saldo de proveedores (aproximado con el costo de ventas).",
+                                "Mayor valor: pagos más rápidos; menor valor: más plazo financiado por proveedores."),
+    "Cobertura de intereses": ("Cuántas veces la utilidad operativa alcanza para pagar los intereses de la deuda.",
+                               "Mayor a 1: la operación cubre los intereses. Valores bajos señalan riesgo."),
+    "Solidez": ("Cuántos pesos de activo respaldan cada peso de deuda.",
+                "Mayor a 1: los activos superan las deudas."),
+    "Inmovilización de activos": ("Porcentaje del activo total que está invertido en activos de largo plazo (no circulantes).",
+                                  "Un valor alto implica menos flexibilidad; depende mucho del giro de la empresa."),
+}
+
+
+# --------------------------- Flujo de efectivo (método indirecto) ---------------------------
+
+CF_CASH = {"Caja", "Bancos"}
+CF_FIN_CORTO = {"Préstamos bancarios a corto plazo"}
+
+
+def cash_flow(df):
+    """Estado de flujo de efectivo por método indirecto desde las variaciones del balance.
+
+    Operación: utilidad neta + depreciación/amortización + cambios en capital de trabajo.
+    Inversión: cambios en activos no circulantes e inversiones temporales.
+    Financiamiento: deuda de largo plazo, préstamos de corto plazo y movimientos de capital.
+    Efectivo = Caja + Bancos. Concilia solo si el balance cuadra en ambos periodos.
+    """
+    d = df.copy()
+    d["Cambio"] = d["Reciente"] - d["Anterior"]
+    ni = float(d.loc[d["Concepto"].str.casefold() == "utilidad neta", "Reciente"].sum())
+    op, inv, fin = [], [], []
+    if abs(ni) >= 0.005:
+        op.append(("Utilidad neta del periodo", ni))
+
+    contra = d[(d["Categoria"] == "Activo no circulante") & d["Concepto"].isin(CUENTAS_CONTRA_ACTIVO)]
+    dep = float(contra["Reciente"].abs().sum() - contra["Anterior"].abs().sum())
+    if abs(dep) >= 0.005:
+        op.append(("Depreciación y amortización (sin efecto en efectivo)", dep))
+
+    for _, r in d.iterrows():
+        c, cat, ch = r["Concepto"], r["Categoria"], float(r["Cambio"])
+        if abs(ch) < 0.005 or c in CF_CASH:
+            continue
+        word = "Aumento" if ch > 0 else "Disminución"
+        if cat == "Activo circulante":
+            (inv if c == "Inversiones temporales" else op).append((f"{word} en {c}", -ch))
+        elif cat == "Activo no circulante" and c not in CUENTAS_CONTRA_ACTIVO:
+            inv.append((f"{word} en {c}", -ch))
+        elif cat == "Pasivo circulante":
+            (fin if c in CF_FIN_CORTO else op).append((f"{word} en {c}", ch))
+        elif cat == "Pasivo no circulante":
+            fin.append((f"{word} en {c}", ch))
+
+    d_cap = float(d.loc[d["Categoria"] == "Capital contable", "Cambio"].sum())
+    other_cap = d_cap - ni
+    if abs(other_cap) >= 0.005:
+        label = ("Aportaciones, dividendos y otros movimientos de capital" if abs(ni) >= 0.005
+                 else "Movimientos de capital (incluyen el resultado del periodo)")
+        fin.append((label, other_cap))
+
+    sections = []
+    for title, items, sub_label in (
+        ("Actividades de operación", op, "Flujo neto de actividades de operación"),
+        ("Actividades de inversión", inv, "Flujo neto de actividades de inversión"),
+        ("Actividades de financiamiento", fin, "Flujo neto de actividades de financiamiento"),
+    ):
+        sections.append((title, items, sub_label, float(sum(v for _, v in items))))
+    net = sum(s[3] for s in sections)
+    start = float(d.loc[d["Concepto"].isin(CF_CASH), "Anterior"].sum())
+    end = float(d.loc[d["Concepto"].isin(CF_CASH), "Reciente"].sum())
+    return {"sections": sections, "net": net, "start": start, "end": end,
+            "diff": (end - start) - net, "ni": ni}
+
+
+def acct(v):
+    """Formato contable: negativos entre paréntesis."""
+    return f"({abs(v):,.2f})" if v < -0.004 else f"{v:,.2f}"
+
+
+def statement_table(rows, headers):
+    """rows: (tipo, etiqueta, [valores]); tipo = sec | item | tot | grand."""
+    head = '<th scope="col">Concepto</th>' + "".join(f'<th scope="col" class="num">{esc(h)}</th>' for h in headers)
+    body = ""
+    for kind, label, vals in rows:
+        if kind == "sec":
+            body += f'<tr class="sec"><td colspan="{len(headers) + 1}">{esc(label)}</td></tr>'
+        else:
+            cells = "".join(f'<td class="num">{"" if v is None else acct(v)}</td>' for v in vals)
+            body += f'<tr class="{kind}"><td>{esc(label)}</td>{cells}</tr>'
+    H(f'<div class="stmt-wrap"><table class="stmt"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>')
+
+
+def cash_flow_pdf(sheet):
+    cf = cash_flow(sheet)
+    styles = getSampleStyleSheet()
+    rows, bold = [["Concepto", "Importe"]], []
+    for title, items, sub_label, sub in cf["sections"]:
+        bold.append(len(rows)); rows.append([title, ""])
+        for label, amt in items or [("Sin movimientos", None)]:
+            rows.append(["    " + str(label)[:80], "" if amt is None else acct(amt)])
+        bold.append(len(rows)); rows.append([sub_label, acct(sub)])
+    for label, v in (("Aumento (disminución) neto de efectivo", cf["net"]),
+                     ("Efectivo al inicio del periodo", cf["start"]),
+                     ("Efectivo al final del periodo", cf["start"] + cf["net"])):
+        bold.append(len(rows)); rows.append([label, acct(v)])
+    t = Table(rows, colWidths=[6.4 * inch, 1.5 * inch], repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0A2147")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"), ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), .3, colors.HexColor("#DDE3EC")), ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ] + [("FONTNAME", (0, i), (-1, i), "Helvetica-Bold") for i in bold]
+    t.setStyle(TableStyle(style))
+    note = "Efectivo = Caja + Bancos. " + (
+        "El flujo concilia con el balance." if abs(cf["diff"]) < 0.01
+        else f"El flujo NO concilia con el balance (diferencia {cf['diff']:,.2f}).")
+    return [Spacer(1, 14), Paragraph("Estado de flujo de efectivo (método indirecto)", styles["Heading2"]),
+            t, Paragraph(note, styles["Italic"])]
+
+
+def signature_block(record):
+    names = [record["elaboro"] or record["owner_name"], record["reviso"] or "", record["autorizo"] or ""]
+    data = [["", "", "", "", ""], [names[0], "", names[1], "", names[2]],
+            ["Elaboró", "", "Revisó", "", "Autorizó"]]
+    t = Table(data, colWidths=[2.6 * inch, .4 * inch, 2.6 * inch, .4 * inch, 2.6 * inch], rowHeights=[30, None, None])
+    t.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"), ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LINEABOVE", (0, 1), (0, 1), .6, colors.black), ("LINEABOVE", (2, 1), (2, 1), .6, colors.black),
+        ("LINEABOVE", (4, 1), (4, 1), .6, colors.black),
+        ("TEXTCOLOR", (0, 2), (-1, 2), colors.HexColor("#55657D")),
+    ]))
+    return KeepTogether([t])
+
+
 # --------------------------- Base de datos y seguridad ---------------------------
 
 def db():
@@ -391,6 +688,11 @@ def init_db():
             FOREIGN KEY(owner_id) REFERENCES users(id)
         );
         """)
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(analyses)")}
+        for col in ("elaboro", "reviso", "autorizo"):
+            if col not in cols:
+                con.execute(f"ALTER TABLE analyses ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        con.executescript(NEW_TABLES)
 
 
 def password_hash(password, salt=None):
@@ -479,11 +781,12 @@ def totals(df, period):
     for cat in CATALOGO:
         result[cat] = float(df.loc[df["Categoria"] == cat, period].sum())
 
+    # Depreciación/amortización acumulada son cuentas correctoras: reducen el activo no
+    # circulante aunque se capturen con signo positivo (la categoría las sumó, por eso se
+    # retira su valor firmado y se resta su valor absoluto).
+    is_contra = (df["Categoria"] == "Activo no circulante") & df["Concepto"].isin(CUENTAS_CONTRA_ACTIVO)
+    result["Activo no circulante"] -= float(df.loc[is_contra, period].sum() + df.loc[is_contra, period].abs().sum())
     result["Activo total"] = result["Activo circulante"] + result["Activo no circulante"]
-    # Depreciación/amortización acumulada se capturan como saldos negativos o como
-    # cuentas correctoras; si se capturan positivos, se restan del activo.
-    contra = float(df.loc[df["Concepto"].isin(CUENTAS_CONTRA_ACTIVO), period].sum())
-    result["Activo total"] -= max(0.0, contra)
     result["Pasivo total"] = result["Pasivo circulante"] + result["Pasivo no circulante"]
     result["Capital total"] = result["Capital contable"]
     result["Pasivo más capital"] = result["Pasivo total"] + result["Capital total"]
@@ -716,18 +1019,21 @@ def make_pdf(record, sheet, ratios, totals_recent):
         ("BOTTOMPADDING", (0,0), (-1,-1), 4)
     ]))
     story.append(table)
+    story.extend(cash_flow_pdf(sheet))
 
     if ratios:
         story.extend([Spacer(1, 14), Paragraph("Razones financieras", styles["Heading2"])])
         for r in ratios:
             story.append(KeepTogether([
                 Paragraph(f"<b>{r['Razón']} — {r['Periodo']}</b>", styles["Heading3"]),
+                Paragraph(f"Qué es: {xesc(RATIO_INFO.get(r['Razón'], ('', ''))[0])}", styles["Normal"]),
                 Paragraph(f"Fórmula: {r['Fórmula']}", styles["Normal"]),
                 Paragraph(f"Sustitución: {r['Sustitución']}", styles["Normal"]),
                 Paragraph(f"Resultado: {r['Resultado mostrado']}", styles["Normal"]),
                 Paragraph(f"Interpretación: {r['Interpretación']}", styles["Normal"]),
                 Spacer(1, 6)
             ]))
+    story.extend([Spacer(1, 18), signature_block(record)])
     story.extend([
         Spacer(1, 12),
         Paragraph(
@@ -802,28 +1108,33 @@ if not st.session_state.user:
 user = st.session_state.user
 is_admin = user["role"] == "admin"
 
-active = owner_analysis(st.session_state.current_folio, user["id"]) if st.session_state.current_folio else None
+active = analysis_for(st.session_state.current_folio, user)
 if st.session_state.current_folio and not active:
     st.session_state.current_folio = None
 
 NAV = [
     ("Análisis", [("Panel", "dashboard"), ("Nuevo análisis", "note_add"), ("Consulta por folio", "search")]),
-    ("Resultados", [("Hoja verde", "table_view"), ("Razones financieras", "percent"),
-                    ("Gráficas", "bar_chart"), ("Reporte gerencial", "description")]),
+    ("Resultados", [("Estados financieros", "account_balance"), ("Hoja verde", "table_view"),
+                    ("Razones financieras", "percent"), ("Gráficas", "bar_chart"),
+                    ("Reporte gerencial", "description")]),
+    ("Control", [("Documentos", "folder_open"), ("Solicitudes de cambio", "edit_note")]),
 ]
 if is_admin:
-    NAV.append(("Sistema", [("Administrar usuarios", "group")]))
+    NAV.append(("Sistema", [("Administrar usuarios", "group"), ("Editar estados", "edit")]))
+with db() as con:
+    pending = con.execute("SELECT COUNT(*) FROM change_requests WHERE status='pendiente'").fetchone()[0] if is_admin else 0
 
 with st.sidebar:
     H(f'<div class="side-brand">{LOGO}<div><div class="wordmark">FINOVA</div><small>INTELIGENCIA FINANCIERA</small></div></div>')
     H(f'<div class="side-user"><span class="avatar" aria-hidden="true">{esc(user["username"][:1].upper())}</span>'
-      f'<div><b>{esc(user["username"])}</b><span>{"Administrador" if is_admin else "Usuario"}</span></div></div>')
+      f'<div><b>{esc(user["username"])}</b><span>{"Administrador" if is_admin else "Contador"}</span></div></div>')
     if active:
         H(f'<div class="side-ctx"><small>Análisis activo</small><b>{esc(active["company"])}</b><span>{esc(active["folio"])}</span></div>')
     for group_label, items in NAV:
         H(f'<div class="nav-label">{group_label}</div>')
         for name, mat in items:
-            if btn(name, mat, key="nav_" + name, **STRETCH,
+            label = f"{name} ({pending})" if name == "Solicitudes de cambio" and pending else name
+            if btn(label, mat, key="nav_" + name, **STRETCH,
                    type="primary" if st.session_state.page == name else "secondary"):
                 go(name)
     H('<div class="nav-label">Sesión</div>')
@@ -841,14 +1152,16 @@ page = st.session_state.page
 
 if page == "Panel":
     with db() as con:
-        records = con.execute(
-            "SELECT * FROM analyses WHERE owner_id=? ORDER BY id DESC", (user["id"],)
-        ).fetchall()
+        base_q = "SELECT a.*, u.username AS owner_name FROM analyses a JOIN users u ON u.id=a.owner_id "
+        records = (con.execute(base_q + "ORDER BY a.id DESC").fetchall() if is_admin else
+                   con.execute(base_q + "WHERE a.owner_id=? ORDER BY a.id DESC", (user["id"],)).fetchall())
 
     page_header("Centro de mando financiero", "Balances comparativos, variaciones, razones y reportes.", "Panel")
     kpi_row([
-        ("Mis análisis", len(records), "", "", "brand"),
-        ("Empresas analizadas", len({r["company"].casefold() for r in records})),
+        ("Todos los análisis" if is_admin else "Mis análisis", len(records), "", "", "brand"),
+        (("Solicitudes pendientes", pending, "", "Requieren tu atención" if pending else "Sin pendientes",
+          "warn" if pending else "") if is_admin else
+         ("Empresas analizadas", len({r["company"].casefold() for r in records}))),
         ("Último análisis", records[0]["created_at"][:10] if records else "—"),
         ("Análisis activo", active["company"] if active else "Ninguno", "",
          active["folio"] if active else "Ábrelo desde la actividad reciente"),
@@ -868,6 +1181,9 @@ if page == "Panel":
             ("bar-chart", "Gráficas", "Visualiza cambios y composición."),
             ("file-text", "Reporte gerencial", "Exporta un PDF."),
             ("search", "Consulta por folio", "Recupera un análisis guardado."),
+            ("scale", "Estados financieros", "Balance, resultados y flujo de efectivo."),
+            ("folder", "Documentos", "PDF y archivos de respaldo."),
+            ("edit", "Solicitudes de cambio", "Pide o atiende cambios a estados guardados."),
         ]
         for start in range(0, len(tiles), 3):
             for col, (ic, name, desc) in zip(st.columns(3), tiles[start:start + 3]):
@@ -885,7 +1201,8 @@ if page == "Panel":
         H('<hr class="row-sep">')
         for r in records[:8]:
             c = st.columns(spec, **_COL_VA)
-            H(f'<b>{esc(r["company"])}</b><br><span class="mono">{esc(r["folio"])}</span>', c[0])
+            owner = f' · {esc(r["owner_name"])}' if is_admin else ""
+            H(f'<b>{esc(r["company"])}</b><br><span class="mono">{esc(r["folio"])}{owner}</span>', c[0])
             H(f'<span>{esc(r["old_date"])} → {esc(r["new_date"])}</span>', c[1])
             H(f'<span>{esc(r["created_at"][:16].replace("T", " "))}</span>', c[2])
             if c[3].button("Abrir", key="open_" + r["folio"], **STRETCH):
@@ -906,7 +1223,7 @@ elif page == "Administrar usuarios":
         with st.form("new_user_form", border=False):
             c1, c2 = st.columns(2)
             username = c1.text_input("Nuevo usuario")
-            role = c2.selectbox("Rol", ["usuario", "admin"])
+            role = c2.selectbox("Rol", ["usuario", "admin"], format_func=ROLE_LABEL.get)
             password = c1.text_input("Contraseña (mínimo 8 caracteres)", type="password")
             confirm = c2.text_input("Confirmar contraseña", type="password")
             submitted = st.form_submit_button("Registrar usuario", type="primary")
@@ -926,13 +1243,13 @@ elif page == "Administrar usuarios":
 
     st.subheader("Usuarios")
     st.dataframe(
-        [{"ID": u["id"], "Usuario": u["username"], "Rol": u["role"],
+        [{"ID": u["id"], "Usuario": u["username"], "Rol": ROLE_LABEL.get(u["role"], u["role"]),
           "Estado": "Activo" if u["active"] else "Inactivo", "Creado": u["created_at"]} for u in users],
         **STRETCH, hide_index=True
     )
 
     st.subheader("Cambiar estado de una cuenta")
-    others = {f'{u["username"]} · {u["role"]} · {"activo" if u["active"] else "inactivo"}': u["id"] for u in users}
+    others = {f'{u["username"]} · {ROLE_LABEL.get(u["role"], u["role"])} · {"activo" if u["active"] else "inactivo"}': u["id"] for u in users}
     with st.form("user_status_form"):
         c1, c2 = st.columns(2)
         target_label = c1.selectbox("Usuario", list(others.keys()))
@@ -966,6 +1283,10 @@ elif page == "Nuevo análisis":
         rfc = c2.text_input("RFC", value=st.session_state.get("draft_rfc", ""))
         activity = c1.text_input("Actividad económica", value=st.session_state.get("draft_activity", ""))
         currency = c2.selectbox("Moneda", ["MXN", "USD", "EUR"])
+        reviso = c1.text_input("Revisó (nombre)", value=st.session_state.get("draft_reviso", ""),
+                               help="Quién revisa los estados financieros. Opcional.")
+        autorizo = c2.text_input("Autorizó (nombre)", value=st.session_state.get("draft_autorizo", ""),
+                                 help="Quién autoriza los estados financieros. Opcional.")
         comparison_type = st.selectbox("Tipo de comparación", ["Mes contra mes", "Año contra año", "Fecha contra fecha"])
         if comparison_type == "Año contra año":
             c3, c4 = st.columns(2)
@@ -992,6 +1313,8 @@ elif page == "Nuevo análisis":
             st.session_state.draft_company = company.strip()
             st.session_state.draft_rfc = rfc.strip()
             st.session_state.draft_activity = activity.strip()
+            st.session_state.draft_reviso = reviso.strip()
+            st.session_state.draft_autorizo = autorizo.strip()
             st.session_state.draft_currency = currency
             st.session_state.draft_comparison_type = comparison_type
             st.session_state.draft_old_date = old_date.isoformat()
@@ -1008,7 +1331,8 @@ elif page == "Nuevo análisis":
     st.subheader("Captura del balance y cuentas complementarias")
     H(f'<div class="chips"><span class="chip"><b>{esc(st.session_state.draft_company)}</b></span>'
       f'<span class="chip">{esc(st.session_state.draft_old_date)} → {esc(st.session_state.draft_new_date)}</span>'
-      f'<span class="chip">{esc(st.session_state.draft_currency)}</span></div>')
+      f'<span class="chip">{esc(st.session_state.draft_currency)}</span>'
+      f'<span class="chip">Elaboró: {esc(user["username"])}</span></div>')
     st.info(
         "Captura saldos contables en ambos periodos. Las cuentas del estado de resultados son opcionales "
         "y solo alimentan las razones de rentabilidad; no se suman al activo, pasivo ni capital. "
@@ -1069,12 +1393,24 @@ elif page == "Nuevo análisis":
                     st.rerun()
 
     st.divider()
+    upl_n = st.session_state.get("upl_n", 0)
+    st.subheader("Documentos de respaldo")
+    st.caption(f"Opcional: adjunta los estados financieros en PDF u otros archivos (máx. {MAX_MB} MB c/u).")
+    doc_kind = st.selectbox("Tipo de documento", DOC_KINDS, key=f"draft_kind_{upl_n}")
+    uploads = st.file_uploader("Archivos", accept_multiple_files=True, type=sorted(ALLOWED_EXT), key=f"draft_files_{upl_n}")
     filled = sum(1 for x in st.session_state.draft_accounts if x["Anterior"] or x["Reciente"])
     H(f'<div class="chips"><span class="chip"><b>{filled}</b> de {len(st.session_state.draft_accounts)} cuentas con saldo aplicado</span></div>')
-    if st.button("Generar hoja verde y guardar análisis", type="primary"):
+    confirm_lock = st.checkbox(
+        "Confirmo que revisé los saldos. Entiendo que, una vez guardado, solo el administrador puede modificar los estados financieros.",
+        key=f"confirm_lock_{upl_n}")
+    if st.button("Generar hoja verde y guardar análisis", type="primary", disabled=not confirm_lock):
         df = clean_accounts(st.session_state.draft_accounts)
+        upload_errors = [e for e in (validate_upload(u) for u in (uploads or [])) if e]
         if df.empty:
             st.error("Captura al menos una cuenta.")
+        elif upload_errors:
+            for e in upload_errors:
+                st.error(e)
         else:
             folio = "FIN-" + datetime.now().strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:8].upper()
             now = datetime.now().isoformat(timespec="seconds")
@@ -1082,8 +1418,8 @@ elif page == "Nuevo análisis":
                 con.execute("""
                     INSERT INTO analyses(
                       folio,owner_id,company,rfc,activity,currency,comparison_type,
-                      old_date,new_date,accounts_json,adjustments_json,ratios_json,created_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                      old_date,new_date,accounts_json,adjustments_json,ratios_json,created_at,elaboro,reviso,autorizo
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     folio, user["id"], st.session_state.draft_company,
                     st.session_state.get("draft_rfc", ""),
@@ -1093,8 +1429,14 @@ elif page == "Nuevo análisis":
                     st.session_state.draft_old_date,
                     st.session_state.draft_new_date,
                     json.dumps(df.to_dict("records"), ensure_ascii=False),
-                    "{}", "[]", now
+                    "{}", "[]", now,
+                    user["username"], st.session_state.get("draft_reviso", ""), st.session_state.get("draft_autorizo", "")
                 ))
+                for u in uploads or []:
+                    add_attachment(con, folio, u, doc_kind, user["id"])
+                log_event(folio, user["id"], "Estados financieros guardados",
+                          f"{len(uploads or [])} documento(s) adjunto(s)", con)
+            st.session_state.upl_n = upl_n + 1
             st.session_state.current_folio = folio
             st.session_state.page = "Hoja verde"
             st.rerun()
@@ -1102,9 +1444,9 @@ elif page == "Nuevo análisis":
 
 # --------------------------- Cargar análisis actual ---------------------------
 
-elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerencial"]:
+elif page in ["Estados financieros", "Hoja verde", "Razones financieras", "Gráficas", "Reporte gerencial", "Documentos", "Editar estados"]:
     folio = st.session_state.get("current_folio")
-    record = owner_analysis(folio, user["id"]) if folio else None
+    record = analysis_for(folio, user)
     if not record:
         page_header(page, "Esta sección trabaja sobre un análisis guardado.", "Resultados")
         empty_state("file-plus", "No hay un análisis abierto",
@@ -1189,7 +1531,7 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
                     with db() as con:
                         con.execute(
                             "UPDATE analyses SET adjustments_json=? WHERE folio=? AND owner_id=?",
-                            (json.dumps({**overrides, **selected}, ensure_ascii=False), folio, user["id"])
+                            (json.dumps({**overrides, **selected}, ensure_ascii=False), folio, record["owner_id"])
                         )
                     st.success("Clasificaciones guardadas.")
                     st.rerun()
@@ -1211,6 +1553,10 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
             "Para rentabilidad y rotaciones captura las cuentas del estado de resultados. "
             "Las rotaciones con saldos finales son aproximaciones; idealmente se usan saldos promedio y compras netas."
         )
+        with st.expander("¿Qué mide cada razón financiera?"):
+            H('<div class="gloss">' + "".join(
+                f'<div><b>{esc(n)}</b><span>{esc(RATIO_DEFS[n][0])}</span>{esc(RATIO_INFO[n][0])}<br><em>{esc(RATIO_INFO[n][1])}</em></div>'
+                for n in RATIO_DEFS) + '</div>')
         c1, c2 = st.columns([3, 1])
         chosen = c1.multiselect("Razones a calcular", list(RATIO_DEFS.keys()), default=["Razón circulante"])
         period = c2.radio("Periodo", ["Anterior", "Reciente"], horizontal=True)
@@ -1224,7 +1570,7 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
             with db() as con:
                 con.execute(
                     "UPDATE analyses SET ratios_json=? WHERE folio=? AND owner_id=?",
-                    (json.dumps(existing, ensure_ascii=False), folio, user["id"])
+                    (json.dumps(existing, ensure_ascii=False), folio, record["owner_id"])
                 )
             st.success("Razones guardadas.")
             st.rerun()
@@ -1250,7 +1596,7 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
                     f'<div class="ratio"><div class="ratio-top"><span class="ratio-name">{esc(ratio["Razón"])}</span>'
                     f'{badge(ratio["Periodo"], tone or "")}</div>'
                     f'<div class="ratio-value">{esc(big)}<small>{esc(small)}</small></div>'
-                    f'<dl><dt>Fórmula</dt><dd>{esc(ratio["Fórmula"])}</dd>'
+                    f'<dl><dt>Qué es</dt><dd>{esc(RATIO_INFO.get(ratio["Razón"], ("", ""))[0])}</dd><dt>Fórmula</dt><dd>{esc(ratio["Fórmula"])}</dd>'
                     f'<dt>Sustitución</dt><dd class="mono">{esc(ratio["Sustitución"])}</dd></dl>'
                     f'<p>{esc(ratio["Interpretación"])}</p></div>'
                 )
@@ -1268,7 +1614,7 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
                 if c1.button("Sí, eliminar", type="primary", **STRETCH):
                     with db() as con:
                         con.execute("UPDATE analyses SET ratios_json='[]' WHERE folio=? AND owner_id=?",
-                                    (folio, user["id"]))
+                                    (folio, record["owner_id"]))
                     st.session_state.confirm_delete_ratios = False
                     st.rerun()
                 if c2.button("Cancelar", **STRETCH):
@@ -1384,15 +1730,330 @@ elif page in ["Hoja verde", "Razones financieras", "Gráficas", "Reporte gerenci
         )
 
 
+    # ----- Estados financieros -----
+    elif page == "Estados financieros":
+        who = record["elaboro"] or record["owner_name"]
+
+        def sign(role, name):
+            return f'<div class="sign"><small>{role}</small><b>{esc(name) if name else "Pendiente"}</b></div>'
+
+        H(f'<div class="sign-grid">{sign("Elaboró", who)}{sign("Revisó", record["reviso"])}'
+          f'{sign("Autorizó", record["autorizo"])}</div>')
+        if is_admin:
+            H(f'<div class="lock">{icon("lock", 18)}<div>Estados protegidos para los contadores. '
+              'Como administrador puedes modificarlos desde «Editar estados».</div></div>')
+        else:
+            H(f'<div class="lock">{icon("lock", 18)}<div>Estos estados financieros están protegidos. '
+              'Para modificarlos, envía una solicitud al administrador desde «Solicitudes de cambio».</div></div>')
+
+        headers = [record["old_date"], record["new_date"]]
+        tab_bal, tab_res, tab_cf = st.tabs(["Balance general", "Estado de resultados", "Flujo de efectivo"])
+
+        with tab_bal:
+            rows = []
+            for title, cats, tot_label, tot_key in (
+                ("Activo", ("Activo circulante", "Activo no circulante"), "Total activo", "Activo total"),
+                ("Pasivo", ("Pasivo circulante", "Pasivo no circulante"), "Total pasivo", "Pasivo total"),
+                ("Capital contable", ("Capital contable",), "Total capital contable", "Capital total"),
+            ):
+                rows.append(("sec", title, []))
+                for cat in cats:
+                    sub = df[(df["Categoria"] == cat) & ((df["Anterior"] != 0) | (df["Reciente"] != 0))]
+                    for _, r in sub.iterrows():
+                        sign_ = -1 if r["Concepto"] in CUENTAS_CONTRA_ACTIVO else 1
+                        name = ("(−) " if sign_ < 0 else "") + r["Concepto"]
+                        rows.append(("item", name, [sign_ * abs(r["Anterior"]), sign_ * abs(r["Reciente"])]))
+                    if len(cats) > 1:
+                        rows.append(("tot", f"Total {cat.lower()}", [old_totals[cat], new_totals[cat]]))
+                rows.append(("grand", tot_label, [old_totals[tot_key], new_totals[tot_key]]))
+            rows.append(("grand", "Total pasivo + capital contable",
+                         [old_totals["Pasivo más capital"], new_totals["Pasivo más capital"]]))
+            statement_table(rows, headers)
+            gap = new_totals["Activo total"] - new_totals["Pasivo más capital"]
+            if abs(gap) < 0.01:
+                st.success("El balance reciente cuadra: activo = pasivo + capital.")
+            else:
+                st.warning(f"El balance reciente no cuadra (diferencia {money(gap, cur)}).")
+
+        with tab_res:
+            res = df[(df["Categoria"] == "Estado de resultados (opcional)") & ((df["Anterior"] != 0) | (df["Reciente"] != 0))]
+            if res.empty:
+                st.info("No hay cuentas del estado de resultados con saldo.")
+            else:
+                totals_names = {"Utilidad bruta", "Utilidad operativa", "Utilidad neta"}
+                statement_table(
+                    [("tot" if r["Concepto"] in totals_names else "item", r["Concepto"], [r["Anterior"], r["Reciente"]])
+                     for _, r in res.iterrows()], headers)
+
+        with tab_cf:
+            cf = cash_flow(df)
+            op_t, inv_t, fin_t = (s[3] for s in cf["sections"])
+            kpi_row([
+                ("Operación", fmt_money(op_t), cur, "", "up" if op_t >= 0 else "down"),
+                ("Inversión", fmt_money(inv_t), cur, "", "up" if inv_t >= 0 else "down"),
+                ("Financiamiento", fmt_money(fin_t), cur, "", "up" if fin_t >= 0 else "down"),
+                ("Variación de efectivo", fmt_money(cf["net"]), cur,
+                 f"{fmt_money(cf['start'])} → {fmt_money(cf['start'] + cf['net'])}", "brand"),
+            ])
+            rows = []
+            for title, items, sub_label, sub in cf["sections"]:
+                rows.append(("sec", title, []))
+                rows += [("item", label, [v]) for label, v in items] or [("item", "Sin movimientos", [None])]
+                rows.append(("tot", sub_label, [sub]))
+            rows += [("grand", "Aumento (disminución) neto de efectivo", [cf["net"]]),
+                     ("item", "Efectivo al inicio del periodo", [cf["start"]]),
+                     ("grand", "Efectivo al final del periodo", [cf["start"] + cf["net"]])]
+            statement_table(rows, [f"{record['old_date']} → {record['new_date']}"])
+            if abs(cf["diff"]) < 0.01:
+                st.success("El flujo concilia con el efectivo (Caja + Bancos) del balance.")
+            else:
+                st.warning(
+                    f"El flujo no concilia: el efectivo final del balance es {money(cf['end'], cur)} y el flujo da "
+                    f"{money(cf['start'] + cf['net'], cur)} (diferencia {money(cf['diff'], cur)}). "
+                    "Normalmente se debe a que el balance no cuadra en alguno de los dos periodos."
+                )
+            if abs(cf["ni"]) < 0.005:
+                st.info("No capturaste «Utilidad neta»: sin ella no se separa el resultado del periodo de los "
+                        "movimientos de capital y la clasificación entre operación y financiamiento será imprecisa.")
+            st.caption("Método indirecto, calculado con las variaciones entre ambos balances. "
+                       "Efectivo = Caja + Bancos. Es un estado preliminar sujeto a revisión del contador.")
+
+        with st.expander("Historial de cambios"):
+            with db() as con:
+                log = con.execute(
+                    "SELECT l.created_at, u.username, l.action, l.detail FROM analysis_log l "
+                    "JOIN users u ON u.id=l.user_id WHERE l.folio=? ORDER BY l.id DESC", (folio,)).fetchall()
+            if log:
+                st.dataframe([{"Fecha": x["created_at"].replace("T", " "), "Usuario": x["username"],
+                               "Acción": x["action"], "Detalle": x["detail"]} for x in log],
+                             **STRETCH, hide_index=True)
+            else:
+                st.caption("Sin eventos registrados todavía.")
+
+    # ----- Documentos -----
+    elif page == "Documentos":
+        flash()
+        st.info("Los documentos subidos no se pueden reemplazar ni eliminar por los contadores. "
+                "Para corregir uno, solicita el cambio al administrador.")
+        with db() as con:
+            files = con.execute(
+                "SELECT f.id, f.filename, f.kind, f.size, f.sha256, f.created_at, f.data, u.username "
+                "FROM attachments f JOIN users u ON u.id=f.uploaded_by WHERE f.folio=? ORDER BY f.id DESC",
+                (folio,)).fetchall()
+
+        pending_del = st.session_state.get("confirm_del_file")
+        if is_admin and pending_del:
+            st.warning("¿Eliminar este documento? Esta acción no se puede deshacer.")
+            c1, c2, _ = st.columns([1, 1, 2])
+            if c1.button("Sí, eliminar", type="primary", **STRETCH, key="del_yes"):
+                with db() as con:
+                    name = con.execute("SELECT filename FROM attachments WHERE id=? AND folio=?", (pending_del, folio)).fetchone()
+                    con.execute("DELETE FROM attachments WHERE id=? AND folio=?", (pending_del, folio))
+                    log_event(folio, user["id"], "Documento eliminado", name["filename"] if name else "", con)
+                st.session_state.confirm_del_file = None
+                st.session_state.flash = "Documento eliminado."
+                st.rerun()
+            if c2.button("Cancelar", **STRETCH, key="del_no"):
+                st.session_state.confirm_del_file = None
+                st.rerun()
+
+        st.subheader(f"Archivos ({len(files)})")
+        if not files:
+            empty_state("file-text", "Aún no hay documentos", "Sube aquí los estados financieros en PDF u otros archivos de respaldo.")
+        for f in files:
+            c = st.columns([3.4, 2.2, 1.5, 1.2] if is_admin else [3.4, 2.2, 1.5], **_COL_VA)
+            H(f'<b>{esc(f["filename"])}</b><br>{badge(f["kind"])}', c[0])
+            H(f'<span class="mono">{f["size"] / 1024:,.0f} KB · SHA-256 {esc(f["sha256"][:12])}…</span><br>'
+              f'<span class="mono">{esc(f["username"])} · {esc(f["created_at"][:16].replace("T", " "))}</span>', c[1])
+            c[2].download_button("Descargar", bytes(f["data"]), file_name=f["filename"],
+                                 key=f"dl_{f['id']}", **STRETCH)
+            if is_admin and c[3].button("Eliminar", key=f"del_{f['id']}", **STRETCH):
+                st.session_state.confirm_del_file = f["id"]
+                st.rerun()
+            H('<hr class="row-sep">')
+
+        st.subheader("Agregar documentos")
+        with st.form("upload_form", clear_on_submit=True):
+            kind = st.selectbox("Tipo de documento", DOC_KINDS)
+            ups = st.file_uploader(f"Archivos (máx. {MAX_MB} MB c/u)", accept_multiple_files=True, type=sorted(ALLOWED_EXT))
+            go_up = st.form_submit_button("Subir documentos", type="primary")
+        if go_up:
+            errors = [e for e in (validate_upload(u) for u in ups) if e]
+            if not ups:
+                st.warning("Selecciona al menos un archivo.")
+            elif errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                with db() as con:
+                    for u in ups:
+                        add_attachment(con, folio, u, kind, user["id"])
+                st.session_state.flash = f"{len(ups)} documento(s) agregado(s)."
+                st.rerun()
+
+    # ----- Editar estados (solo administrador) -----
+    elif page == "Editar estados":
+        if not is_admin:
+            st.error("Acceso exclusivo para administradores.")
+            st.stop()
+        flash()
+        with db() as con:
+            open_reqs = con.execute(
+                "SELECT r.id, r.reason, u.username FROM change_requests r JOIN users u ON u.id=r.requester_id "
+                "WHERE r.folio=? AND r.status='pendiente' ORDER BY r.id", (folio,)).fetchall()
+        st.info("Todo cambio queda registrado en el historial con tu usuario y el motivo. "
+                "Los importes no pueden ser negativos.")
+        ver = st.session_state.get("edit_ver", 0)
+        with st.form("edit_statements"):
+            c1, c2, c3 = st.columns(3)
+            elaboro = c1.text_input("Elaboró", value=record["elaboro"] or record["owner_name"])
+            reviso = c2.text_input("Revisó", value=record["reviso"] or "")
+            autorizo = c3.text_input("Autorizó", value=record["autorizo"] or "")
+            edits = {}
+            for cat in CATALOGO:
+                sub = df[df["Categoria"] == cat][["Concepto", "Anterior", "Reciente"]]
+                if sub.empty:
+                    continue
+                with st.expander(cat):
+                    edits[cat] = st.data_editor(
+                        sub, key=f"adm_{cat}_{ver}", hide_index=True, disabled=["Concepto"], **STRETCH,
+                        column_config={
+                            "Anterior": st.column_config.NumberColumn(record["old_date"], min_value=0.0, step=100.0, format="%.2f"),
+                            "Reciente": st.column_config.NumberColumn(record["new_date"], min_value=0.0, step=100.0, format="%.2f"),
+                        })
+            reason = st.text_input("Motivo del cambio *")
+            req_opts = {"Ninguna": None, **{f"#{r['id']} · {r['username']}: {r['reason'][:70]}": r["id"] for r in open_reqs}}
+            linked = st.selectbox("Solicitud que atiende este cambio", list(req_opts))
+            submitted = st.form_submit_button("Guardar cambios", type="primary")
+        if submitted:
+            if not reason.strip():
+                st.error("Indica el motivo del cambio.")
+            else:
+                work = df.set_index("Concepto")
+                changes = []
+                for cat, ed in edits.items():
+                    for _, row in ed.iterrows():
+                        a = max(0.0, float(row["Anterior"] or 0))
+                        r_ = max(0.0, float(row["Reciente"] or 0))
+                        old = work.loc[row["Concepto"]]
+                        if abs(old["Anterior"] - a) >= 0.005 or abs(old["Reciente"] - r_) >= 0.005:
+                            changes.append(f"{row['Concepto']}: {old['Anterior']:,.2f}→{a:,.2f} / {old['Reciente']:,.2f}→{r_:,.2f}")
+                            work.loc[row["Concepto"], ["Anterior", "Reciente"]] = [a, r_]
+                meta_old = (record["elaboro"] or record["owner_name"], record["reviso"] or "", record["autorizo"] or "")
+                meta_new = (elaboro.strip(), reviso.strip(), autorizo.strip())
+                if not changes and meta_old == meta_new:
+                    st.info("No hay cambios que guardar.")
+                else:
+                    updated = clean_accounts(work.reset_index()[["Concepto", "Categoria", "Anterior", "Reciente"]])
+                    detail = reason.strip() + " | " + "; ".join(changes[:15]) + (" …" if len(changes) > 15 else "")
+                    if meta_old != meta_new:
+                        detail += f" | Firmas: elaboró={meta_new[0]}, revisó={meta_new[1]}, autorizó={meta_new[2]}"
+                    with db() as con:
+                        con.execute("UPDATE analyses SET accounts_json=?, elaboro=?, reviso=?, autorizo=? WHERE folio=?",
+                                    (json.dumps(updated.to_dict("records"), ensure_ascii=False), *meta_new, folio))
+                        log_event(folio, user["id"], "Cambio de estados financieros", detail, con)
+                        rid = req_opts[linked]
+                        if rid:
+                            con.execute("UPDATE change_requests SET status='atendida', resolver_id=?, resolution_note=?, resolved_at=? WHERE id=?",
+                                        (user["id"], reason.strip(), now_iso(), rid))
+                            log_event(folio, user["id"], "Solicitud atendida", f"#{rid}", con)
+                    st.session_state.edit_ver = ver + 1
+                    st.session_state.flash = f"Cambios guardados ({len(changes)} cuenta(s) modificada(s))."
+                    st.rerun()
+
+
+# --------------------------- Solicitudes de cambio ---------------------------
+
+elif page == "Solicitudes de cambio":
+    page_header("Solicitudes de cambio",
+                "Revisa y atiende las solicitudes de los contadores." if is_admin
+                else "Los estados guardados solo los modifica el administrador: pide aquí el cambio.", "Control")
+    flash()
+    badge_tone = {"pendiente": "warn", "atendida": "ok", "rechazada": "err"}
+    q_base = ("SELECT r.*, a.company, u.username AS requester, v.username AS resolver FROM change_requests r "
+              "JOIN analyses a ON a.folio=r.folio JOIN users u ON u.id=r.requester_id "
+              "LEFT JOIN users v ON v.id=r.resolver_id ")
+
+    if is_admin:
+        with db() as con:
+            pend = con.execute(q_base + "WHERE r.status='pendiente' ORDER BY r.id").fetchall()
+            done = con.execute(q_base + "WHERE r.status!='pendiente' ORDER BY r.resolved_at DESC LIMIT 30").fetchall()
+        st.subheader(f"Pendientes ({len(pend)})")
+        if not pend:
+            empty_state("check", "Sin solicitudes pendientes", "Cuando un contador pida un cambio, aparecerá aquí.")
+        for r in pend:
+            with st.container(border=True):
+                H(f'<b>{esc(r["company"])}</b> <span class="mono">{esc(r["folio"])}</span> {badge("Pendiente", "warn")}<br>'
+                  f'<span class="mono">Solicitó {esc(r["requester"])} · {esc(r["created_at"][:16].replace("T", " "))}</span>')
+                st.text(r["reason"])
+                if st.button("Abrir y editar estados", key=f"req_open_{r['id']}"):
+                    st.session_state.current_folio = r["folio"]
+                    go("Editar estados")
+                with st.expander("Responder solicitud"):
+                    with st.form(f"req_res_{r['id']}", border=False):
+                        note = st.text_input("Nota para el contador", key=f"req_note_{r['id']}")
+                        a, b = st.columns(2)
+                        ok_btn = a.form_submit_button("Marcar como atendida", type="primary")
+                        no_btn = b.form_submit_button("Rechazar")
+                    if ok_btn or no_btn:
+                        if no_btn and not note.strip():
+                            st.error("Indica el motivo del rechazo en la nota.")
+                        else:
+                            status = "atendida" if ok_btn else "rechazada"
+                            with db() as con:
+                                con.execute("UPDATE change_requests SET status=?, resolver_id=?, resolution_note=?, resolved_at=? WHERE id=?",
+                                            (status, user["id"], note.strip(), now_iso(), r["id"]))
+                                log_event(r["folio"], user["id"], f"Solicitud {status}", f"#{r['id']} {note.strip()}", con)
+                            st.session_state.flash = f"Solicitud {status}."
+                            st.rerun()
+        if done:
+            st.subheader("Historial")
+            st.dataframe([{"Folio": x["folio"], "Empresa": x["company"], "Solicitó": x["requester"],
+                           "Estado": x["status"].capitalize(), "Atendió": x["resolver"] or "—",
+                           "Nota": x["resolution_note"] or "", "Fecha": (x["resolved_at"] or "")[:16].replace("T", " ")}
+                          for x in done], **STRETCH, hide_index=True)
+    else:
+        if active:
+            st.subheader(f"Nueva solicitud · {active['company']}")
+            with st.form("new_request"):
+                reason = st.text_area("¿Qué debe cambiar y por qué? *", height=110,
+                                      placeholder="Ej.: El saldo de Bancos del periodo reciente debe ser 125,400.00 según el estado de cuenta.")
+                sent = st.form_submit_button("Enviar solicitud al administrador", type="primary")
+            if sent:
+                if len(reason.strip()) < 15:
+                    st.error("Describe el cambio con al menos 15 caracteres.")
+                else:
+                    with db() as con:
+                        cur_ = con.execute("INSERT INTO change_requests(folio,requester_id,reason,created_at) VALUES(?,?,?,?)",
+                                           (active["folio"], user["id"], reason.strip(), now_iso()))
+                        log_event(active["folio"], user["id"], "Solicitud de cambio", f"#{cur_.lastrowid} {reason.strip()[:200]}", con)
+                    st.session_state.flash = "Solicitud enviada. El administrador la revisará."
+                    st.rerun()
+        else:
+            st.info("Abre un análisis desde el Panel para solicitar un cambio sobre él.")
+        with db() as con:
+            mine = con.execute(q_base + "WHERE r.requester_id=? ORDER BY r.id DESC", (user["id"],)).fetchall()
+        st.subheader("Mis solicitudes")
+        if not mine:
+            st.caption("Aún no has enviado solicitudes.")
+        for r in mine:
+            with st.container(border=True):
+                H(f'<b>{esc(r["company"])}</b> <span class="mono">{esc(r["folio"])}</span> '
+                  f'{badge(r["status"].capitalize(), badge_tone.get(r["status"], ""))}')
+                st.text(r["reason"])
+                if r["resolution_note"]:
+                    H(f'<span class="mono">Respuesta de {esc(r["resolver"] or "—")}: {esc(r["resolution_note"])}</span>')
+
+
 # --------------------------- Consulta por folio ---------------------------
 
 elif page == "Consulta por folio":
-    page_header("Consulta por folio", "Solo puedes abrir los análisis asociados a tu usuario.", "Análisis")
+    page_header("Consulta por folio", "Como administrador puedes abrir cualquier análisis." if is_admin else "Solo puedes abrir los análisis asociados a tu usuario.", "Análisis")
     with st.form("lookup_form"):
         search_folio = st.text_input("Folio completo", placeholder="FIN-20260101-AB12CD34")
         searched = st.form_submit_button("Consultar análisis", type="primary")
     if searched:
-        found = owner_analysis(search_folio.strip().upper(), user["id"])
+        found = analysis_for(search_folio.strip().upper(), user)
         if not found:
             st.session_state.lookup_folio = None
             st.error("Folio no encontrado o no tienes permiso para consultarlo.")
@@ -1402,7 +2063,7 @@ elif page == "Consulta por folio":
             st.rerun()
 
     lookup = st.session_state.get("lookup_folio")
-    record = owner_analysis(lookup, user["id"]) if lookup else None
+    record = analysis_for(lookup, user)
     if record:
         H(f'<div class="chips">{badge("Análisis recuperado", "ok")}</div>')
         kpi_row([
@@ -1410,7 +2071,7 @@ elif page == "Consulta por folio":
             ("RFC", record["rfc"] or "No indicado"),
             ("Comparación", f"{record['old_date']} → {record['new_date']}"),
             ("Creado", record["created_at"].replace("T", " ")),
-        ])
+        ] + ([("Contador", record["owner_name"])] if is_admin else []))
         if btn("Abrir hoja verde", "table_view", type="primary", key="lookup_open"):
             go("Hoja verde")
         st.subheader("Cuentas capturadas")

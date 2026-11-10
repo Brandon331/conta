@@ -1304,7 +1304,7 @@ page = st.session_state.page
 
 
 # --------------------------- Panel ---------------------------
-def save_new_analysis(df, uploads, doc_kind, pending_capture=False):
+def save_new_analysis(df, uploads, doc_kind, pending_capture=False, note=""):
     folio = "FIN-" + datetime.now().strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:8].upper()
     now = now_iso()
     with db() as con:
@@ -1328,7 +1328,7 @@ def save_new_analysis(df, uploads, doc_kind, pending_capture=False):
         for u in uploads or []:
             add_attachment(con, folio, u, doc_kind, user["id"])
         log_event(folio, user["id"], "Análisis creado",
-                  f"{len(uploads or [])} documento(s) adjunto(s)", con)
+                  f"{len(uploads or [])} documento(s) adjunto(s). {note}".strip(), con)
         if pending_capture:
             cur_ = con.execute(
                 "INSERT INTO change_requests(folio,requester_id,reason,created_at) VALUES(?,?,?,?)",
